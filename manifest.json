@@ -3,11 +3,10 @@
     "loading_order": 100,
     "requires": [],
     "optional": [],
-    "dependencies": [],
     "js": "index.js",
     "css": "style.css",
     "author": "Kristalium",
     "version": "1.0.0",
-    "homePage": "",
-    "auto_update": false
+    "homePage": "https://github.com/kristalium/StreamingHandbrake",
+    "auto_update": true
 }
