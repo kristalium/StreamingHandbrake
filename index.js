@@ -7,7 +7,6 @@ const MODULE_NAME = 'streaming_handbrake';
 const defaultSettings = Object.freeze({
     enabled: true,
     notify: true,
-    trimMatch: true,
     // Minimum time (ms) between checks, to avoid hammering regex tests on every
     // single token during very fast streams. 0 = check every token.
     checkThrottleMs: 0,
@@ -100,26 +99,6 @@ function testTrigger(text, trigger) {
 // Actions
 // ---------------------------------------------------------------------------
 
-function truncateCurrentMessage(newText) {
-    try {
-        const { chat } = SillyTavern.getContext();
-        const lastMes = chat?.[chat.length - 1];
-        if (lastMes) {
-            lastMes.mes = newText;
-        }
-
-        // Best-effort immediate visual feedback while the stop takes effect.
-        const mesBlocks = document.querySelectorAll('#chat .mes');
-        const lastBlock = mesBlocks[mesBlocks.length - 1];
-        const textEl = lastBlock?.querySelector('.mes_text');
-        if (textEl) {
-            textEl.textContent = newText;
-        }
-    } catch (e) {
-        console.error(`[${MODULE_NAME}] Failed to truncate in-progress message:`, e);
-    }
-}
-
 function pullHandbrake() {
     // Best-effort: click the visible stop-generation button.
     const stopBtn = document.getElementById('mes_stop');
@@ -138,24 +117,16 @@ function pullHandbrake() {
     }));
 }
 
-// Once a trigger fires, ST's own streaming renderer keeps re-writing the
-// message from its internal buffer on every subsequent token — and does one
-// more full write when it finalizes the message after stop takes effect. A
-// single truncation gets overwritten by that. So instead of truncating once,
-// we keep re-asserting the truncated text on every following tick (and on the
-// relevant lifecycle events) until the generation is fully, truly done.
-let handbrakeState = null; // { truncatedText: string } | null
+// Once a trigger fires for a generation, don't keep re-checking every
+// subsequent token — the stop is already in flight.
+let handbrakeActive = false;
 
-function handleTrigger(trigger, text, match) {
+function handleTrigger(trigger, match) {
     const settings = getSettings();
-    const truncatedText = text.slice(0, match.index);
 
     console.log(`[${MODULE_NAME}] Trigger "${trigger.label || trigger.pattern}" matched at index ${match.index}. Pulling the handbrake.`);
 
-    if (settings.trimMatch) {
-        handbrakeState = { truncatedText };
-        truncateCurrentMessage(truncatedText);
-    }
+    handbrakeActive = true;
 
     if (settings.notify && typeof toastr !== 'undefined') {
         toastr.warning(`Stopped generation: "${trigger.label || trigger.pattern}"`, 'Streaming Handbrake');
@@ -164,28 +135,14 @@ function handleTrigger(trigger, text, match) {
     pullHandbrake();
 }
 
-function reassertTruncation() {
-    if (!handbrakeState) return;
-    if (getSettings().trimMatch) {
-        truncateCurrentMessage(handbrakeState.truncatedText);
-    }
-}
-
-function finalizeHandbrake() {
-    if (!handbrakeState) return;
-    reassertTruncation();
-    handbrakeState = null;
+function resetHandbrake() {
+    handbrakeActive = false;
 }
 
 let lastCheckTime = 0;
 
 function onStreamToken(eventData) {
-    // Already pulled the brake this generation: stop looking for new
-    // triggers, just keep fighting ST's re-renders until it actually stops.
-    if (handbrakeState) {
-        reassertTruncation();
-        return;
-    }
+    if (handbrakeActive) return; // already stopping this generation
 
     const settings = getSettings();
     if (!settings.enabled) return;
@@ -202,7 +159,7 @@ function onStreamToken(eventData) {
     for (const trigger of settings.triggers) {
         const match = testTrigger(text, trigger);
         if (match) {
-            handleTrigger(trigger, text, match);
+            handleTrigger(trigger, match);
             return; // one handbrake pull per generation is enough
         }
     }
@@ -261,11 +218,6 @@ function bindSettingsEvents() {
         saveSettings();
     });
 
-    $('#handbrake_trim').prop('checked', settings.trimMatch).on('change', function () {
-        settings.trimMatch = $(this).prop('checked');
-        saveSettings();
-    });
-
     $('#handbrake_add_trigger').on('click', function () {
         settings.triggers.push({
             id: uid(),
@@ -321,10 +273,6 @@ function buildSettingsPanel() {
                     <input id="handbrake_notify" type="checkbox" />
                     Show a toast when the handbrake is pulled
                 </label>
-                <label class="checkbox_label">
-                    <input id="handbrake_trim" type="checkbox" />
-                    Trim the offending text from the message before stopping
-                </label>
 
                 <hr>
                 <b>Triggers</b>
@@ -355,13 +303,9 @@ jQuery(async () => {
 
     eventSource.on(event_types.STREAM_TOKEN_RECEIVED, onStreamToken);
 
-    // These fire around/after the stop actually taking effect, and ST does
-    // its own write of the finalized message text at these points — so we
-    // need to re-assert the truncation there too, then release the state.
-    eventSource.on(event_types.MESSAGE_RECEIVED, reassertTruncation);
-    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, reassertTruncation);
-    eventSource.on(event_types.GENERATION_STOPPED, finalizeHandbrake);
-    eventSource.on(event_types.GENERATION_ENDED, finalizeHandbrake);
+    // Release the "already stopped this generation" flag once it's truly over.
+    eventSource.on(event_types.GENERATION_STOPPED, resetHandbrake);
+    eventSource.on(event_types.GENERATION_ENDED, resetHandbrake);
 
     console.log(`[${MODULE_NAME}] Loaded.`);
 });
