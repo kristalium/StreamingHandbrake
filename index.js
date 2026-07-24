@@ -138,13 +138,23 @@ function pullHandbrake() {
     }));
 }
 
+// Once a trigger fires, ST's own streaming renderer keeps re-writing the
+// message from its internal buffer on every subsequent token — and does one
+// more full write when it finalizes the message after stop takes effect. A
+// single truncation gets overwritten by that. So instead of truncating once,
+// we keep re-asserting the truncated text on every following tick (and on the
+// relevant lifecycle events) until the generation is fully, truly done.
+let handbrakeState = null; // { truncatedText: string } | null
+
 function handleTrigger(trigger, text, match) {
     const settings = getSettings();
+    const truncatedText = text.slice(0, match.index);
 
     console.log(`[${MODULE_NAME}] Trigger "${trigger.label || trigger.pattern}" matched at index ${match.index}. Pulling the handbrake.`);
 
     if (settings.trimMatch) {
-        truncateCurrentMessage(text.slice(0, match.index));
+        handbrakeState = { truncatedText };
+        truncateCurrentMessage(truncatedText);
     }
 
     if (settings.notify && typeof toastr !== 'undefined') {
@@ -154,9 +164,29 @@ function handleTrigger(trigger, text, match) {
     pullHandbrake();
 }
 
+function reassertTruncation() {
+    if (!handbrakeState) return;
+    if (getSettings().trimMatch) {
+        truncateCurrentMessage(handbrakeState.truncatedText);
+    }
+}
+
+function finalizeHandbrake() {
+    if (!handbrakeState) return;
+    reassertTruncation();
+    handbrakeState = null;
+}
+
 let lastCheckTime = 0;
 
 function onStreamToken(eventData) {
+    // Already pulled the brake this generation: stop looking for new
+    // triggers, just keep fighting ST's re-renders until it actually stops.
+    if (handbrakeState) {
+        reassertTruncation();
+        return;
+    }
+
     const settings = getSettings();
     if (!settings.enabled) return;
 
@@ -324,6 +354,14 @@ jQuery(async () => {
     buildSettingsPanel();
 
     eventSource.on(event_types.STREAM_TOKEN_RECEIVED, onStreamToken);
+
+    // These fire around/after the stop actually taking effect, and ST does
+    // its own write of the finalized message text at these points — so we
+    // need to re-assert the truncation there too, then release the state.
+    eventSource.on(event_types.MESSAGE_RECEIVED, reassertTruncation);
+    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, reassertTruncation);
+    eventSource.on(event_types.GENERATION_STOPPED, finalizeHandbrake);
+    eventSource.on(event_types.GENERATION_ENDED, finalizeHandbrake);
 
     console.log(`[${MODULE_NAME}] Loaded.`);
 });
